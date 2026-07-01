@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import router_graph
+import llm_graph
 
 
 # ---------------------------------------------------------------------------
@@ -170,3 +171,53 @@ class TestGraphEndToEnd:
     def test_provider_persisted_in_final_state(self):
         result = self._run("code", "claude", "code answer", "Write a class.")
         assert result["provider"] == "claude"
+
+
+# ---------------------------------------------------------------------------
+# llm_graph integration (reuses router_graph classify + respond via import)
+# ---------------------------------------------------------------------------
+
+class TestLlmGraph:
+    """Verifies that llm_graph.app delegates routing to the shared nodes."""
+
+    def _run(self, classify_label: str, provider: str, answer_text: str, question: str) -> dict:
+        classify_msg = MagicMock(); classify_msg.content = classify_label
+        answer_msg   = MagicMock(); answer_msg.content   = answer_text
+
+        fake = {
+            "claude": make_model("claude fallback"),
+            "gpt":    make_model("gpt fallback"),
+        }
+        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [classify_msg, answer_msg]
+        if provider != router_graph.DEFAULT_PROVIDER:
+            fake[provider] = make_model(answer_text)
+
+        with patch.dict(router_graph.PROVIDERS, fake, clear=True):
+            return llm_graph.app.invoke({"question": question, "provider": "", "answer": ""})
+
+    def test_uses_router_graph_app_is_distinct_object(self):
+        """llm_graph compiles its own graph rather than re-using router_graph.app."""
+        assert llm_graph.app is not router_graph.app
+
+    def test_general_question_routed_to_gpt(self):
+        result = self._run("general", "gpt", "Hello there!", "Say hello in exactly 5 words.")
+        assert "[gpt]" in result["answer"]
+        assert "Hello there!" in result["answer"]
+
+    def test_code_question_routed_to_claude(self):
+        result = self._run("code", "claude", "def add(a, b): return a + b", "Write a function to add two numbers.")
+        assert "[claude]" in result["answer"]
+        assert "def add" in result["answer"]
+
+    def test_state_keys_present(self):
+        result = self._run("general", "gpt", "any answer", "Any question?")
+        assert {"question", "provider", "answer"} <= result.keys()
+
+    def test_provider_set_in_final_state(self):
+        result = self._run("code", "claude", "code answer", "Write a class.")
+        assert result["provider"] == "claude"
+
+    def test_original_question_preserved(self):
+        q = "Say hello in exactly 5 words."
+        result = self._run("general", "gpt", "Hi there, how are you?", q)
+        assert result["question"] == q
