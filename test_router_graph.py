@@ -11,6 +11,7 @@ import pytest
 import router_graph
 import llm_graph
 import hello_graph
+import streaming_graph
 
 
 # ---------------------------------------------------------------------------
@@ -288,3 +289,87 @@ class TestHelloGraph:
         q = "Write a sort function."
         result = self._run("code", "claude", "sorted code", q)
         assert result["question"] == q
+
+
+# ---------------------------------------------------------------------------
+# streaming_graph — stream_mode='updates' and stream_mode='values'
+# ---------------------------------------------------------------------------
+
+class TestStreamingGraph:
+    """Verifies streaming behaviour without live API calls."""
+
+    def _stream(self, mode: str, classify_label: str, provider: str,
+                answer_text: str, question: str) -> list:
+        fake = {
+            "claude": make_model("claude fallback"),
+            "gpt":    make_model("gpt fallback"),
+        }
+        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [
+            msg(classify_label), msg(answer_text)
+        ]
+        if provider != router_graph.DEFAULT_PROVIDER:
+            fake[provider] = make_model(answer_text)
+
+        with patch.dict(router_graph.PROVIDERS, fake, clear=True):
+            return list(streaming_graph.app.stream(
+                {"question": question, "provider": "", "answer": ""},
+                stream_mode=mode,
+            ))
+
+    # --- updates mode ---
+
+    def test_updates_yields_one_chunk_per_node(self):
+        chunks = self._stream("updates", "general", "gpt", "Paris.", "Capital of France?")
+        # graph has exactly two nodes: classify and respond
+        assert len(chunks) == 2
+
+    def test_updates_chunk_keys_are_node_names(self):
+        chunks = self._stream("updates", "general", "gpt", "Paris.", "Capital of France?")
+        node_names = [list(c.keys())[0] for c in chunks]
+        assert node_names == ["classify", "respond"]
+
+    def test_updates_classify_chunk_contains_provider(self):
+        chunks = self._stream("updates", "code", "claude", "def f(): ...", "Write a function.")
+        classify_delta = chunks[0]["classify"]
+        assert "provider" in classify_delta
+        assert classify_delta["provider"] == "claude"
+
+    def test_updates_respond_chunk_contains_answer(self):
+        chunks = self._stream("updates", "general", "gpt", "Paris.", "Capital of France?")
+        respond_delta = chunks[1]["respond"]
+        assert "answer" in respond_delta
+        assert "Paris." in respond_delta["answer"]
+
+    def test_updates_respond_chunk_does_not_contain_question(self):
+        """respond() only writes 'answer' — it should not repeat unchanged keys."""
+        chunks = self._stream("updates", "general", "gpt", "Paris.", "Capital of France?")
+        respond_delta = chunks[1]["respond"]
+        assert "question" not in respond_delta
+
+    # --- values mode ---
+
+    def test_values_yields_one_snapshot_per_node(self):
+        snapshots = self._stream("values", "general", "gpt", "Paris.", "Capital of France?")
+        # LangGraph emits the initial state first, then one snapshot per node:
+        # [initial, after-classify, after-respond] = 3 total for a 2-node graph.
+        assert len(snapshots) == 3
+
+    def test_values_each_snapshot_is_full_state(self):
+        snapshots = self._stream("values", "general", "gpt", "Paris.", "Capital of France?")
+        for snapshot in snapshots:
+            assert {"question", "provider", "answer"} <= snapshot.keys()
+
+    def test_values_second_snapshot_has_provider_set(self):
+        """snapshots[0] is the initial state; snapshots[1] is after classify runs."""
+        snapshots = self._stream("values", "code", "claude", "def f(): ...", "Write a function.")
+        assert snapshots[0]["provider"] == ""       # initial — classify hasn't run
+        assert snapshots[1]["provider"] == "claude"  # after classify
+        assert snapshots[1]["answer"] == ""          # respond hasn't run yet
+
+    def test_values_final_snapshot_has_answer(self):
+        snapshots = self._stream("values", "general", "gpt", "Paris.", "Capital of France?")
+        assert "Paris." in snapshots[-1]["answer"]
+
+    def test_streaming_app_is_distinct_object(self):
+        assert streaming_graph.app is not router_graph.app
+        assert streaming_graph.app is not llm_graph.app
