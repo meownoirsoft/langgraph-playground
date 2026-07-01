@@ -10,18 +10,22 @@ import pytest
 
 import router_graph
 import llm_graph
+import hello_graph
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def msg(content: str) -> types.SimpleNamespace:
+    """Lightweight stand-in for a LangChain AIMessage — only .content is needed."""
+    return types.SimpleNamespace(content=content)
+
+
 def make_model(content: str) -> MagicMock:
     """Return a fake LangChain chat model whose .invoke() returns a message."""
     model = MagicMock()
-    msg = MagicMock()
-    msg.content = content
-    model.invoke.return_value = msg
+    model.invoke.return_value = msg(content)
     return model
 
 
@@ -36,11 +40,10 @@ def fake_providers(classify_response: str, answer_responses: dict[str, str]) -> 
     # Give the default provider a secondary classify-response first so the
     # classification call consumes it, then further calls return the answer.
     default = router_graph.DEFAULT_PROVIDER
-    classify_msg = MagicMock()
-    classify_msg.content = classify_response
-    answer_msg = MagicMock()
-    answer_msg.content = answer_responses.get(default, "default answer")
-    providers[default].invoke.side_effect = [classify_msg, answer_msg]
+    providers[default].invoke.side_effect = [
+        msg(classify_response),
+        msg(answer_responses.get(default, "default answer")),
+    ]
     return providers
 
 
@@ -88,9 +91,9 @@ class TestClassify:
             "gpt": make_model("general"),
         }
         # Re-patch side_effect for the default classifier
-        classify_msg = MagicMock(); classify_msg.content = "general"
-        answer_msg   = MagicMock(); answer_msg.content   = "gpt answer"
-        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [classify_msg, answer_msg]
+        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [
+            msg("general"), msg("gpt answer")
+        ]
 
         with patch.dict(router_graph.PROVIDERS, fake, clear=True):
             router_graph.classify({"question": "Tell me a joke.", "provider": "", "answer": ""})
@@ -138,14 +141,13 @@ class TestRespond:
 
 class TestGraphEndToEnd:
     def _run(self, classify_label: str, provider: str, answer_text: str, question: str) -> dict:
-        classify_msg = MagicMock(); classify_msg.content = classify_label
-        answer_msg   = MagicMock(); answer_msg.content   = answer_text
-
         fake = {
             "claude": make_model("claude fallback"),
             "gpt": make_model("gpt fallback"),
         }
-        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [classify_msg, answer_msg]
+        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [
+            msg(classify_label), msg(answer_text)
+        ]
         # If routing lands on non-default provider, wire its answer too
         if provider != router_graph.DEFAULT_PROVIDER:
             fake[provider] = make_model(answer_text)
@@ -181,14 +183,13 @@ class TestLlmGraph:
     """Verifies that llm_graph.app delegates routing to the shared nodes."""
 
     def _run(self, classify_label: str, provider: str, answer_text: str, question: str) -> dict:
-        classify_msg = MagicMock(); classify_msg.content = classify_label
-        answer_msg   = MagicMock(); answer_msg.content   = answer_text
-
         fake = {
             "claude": make_model("claude fallback"),
             "gpt":    make_model("gpt fallback"),
         }
-        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [classify_msg, answer_msg]
+        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [
+            msg(classify_label), msg(answer_text)
+        ]
         if provider != router_graph.DEFAULT_PROVIDER:
             fake[provider] = make_model(answer_text)
 
@@ -220,4 +221,70 @@ class TestLlmGraph:
     def test_original_question_preserved(self):
         q = "Say hello in exactly 5 words."
         result = self._run("general", "gpt", "Hi there, how are you?", q)
+        assert result["question"] == q
+
+
+# ---------------------------------------------------------------------------
+# hello_graph — counter loop chained into router classify + respond
+# ---------------------------------------------------------------------------
+
+class TestHelloGraph:
+    """Verifies the counter loop runs to MAX_COUNT then hands off to the router."""
+
+    def _run(self, classify_label: str, provider: str, answer_text: str,
+             question: str, start_count: int = 0) -> dict:
+        fake = {
+            "claude": make_model("claude fallback"),
+            "gpt":    make_model("gpt fallback"),
+        }
+        fake[router_graph.DEFAULT_PROVIDER].invoke.side_effect = [
+            msg(classify_label), msg(answer_text)
+        ]
+        if provider != router_graph.DEFAULT_PROVIDER:
+            fake[provider] = make_model(answer_text)
+
+        with patch.dict(router_graph.PROVIDERS, fake, clear=True):
+            return hello_graph.app.invoke({
+                "count": start_count,
+                "question": question,
+                "provider": "",
+                "answer": "",
+            })
+
+    def test_count_reaches_max(self):
+        result = self._run("general", "gpt", "any answer", "Any question?")
+        assert result["count"] == hello_graph.MAX_COUNT
+
+    def test_count_increments_from_zero(self):
+        result = self._run("general", "gpt", "any answer", "Any question?", start_count=0)
+        assert result["count"] == hello_graph.MAX_COUNT
+
+    def test_loop_runs_once_when_starting_at_max(self):
+        """increment is always the entry point, so count increments once even when
+        starting at MAX_COUNT before should_continue routes to classify."""
+        result = self._run("general", "gpt", "any answer", "Any question?",
+                           start_count=hello_graph.MAX_COUNT)
+        assert result["count"] == hello_graph.MAX_COUNT + 1
+
+    def test_code_question_routed_to_claude(self):
+        result = self._run("code", "claude", "def add(a, b): return a + b",
+                           "Write a function to add two numbers.")
+        assert "[claude]" in result["answer"]
+
+    def test_general_question_routed_to_gpt(self):
+        result = self._run("general", "gpt", "Preheat oven to 350°F", "Banana bread recipe?")
+        assert "[gpt]" in result["answer"]
+        assert "Preheat oven" in result["answer"]
+
+    def test_is_distinct_compiled_graph(self):
+        assert hello_graph.app is not router_graph.app
+        assert hello_graph.app is not llm_graph.app
+
+    def test_all_state_keys_present(self):
+        result = self._run("general", "gpt", "some answer", "Any question?")
+        assert {"count", "question", "provider", "answer"} <= result.keys()
+
+    def test_question_preserved_through_loop(self):
+        q = "Write a sort function."
+        result = self._run("code", "claude", "sorted code", q)
         assert result["question"] == q
