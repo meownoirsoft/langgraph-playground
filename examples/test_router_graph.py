@@ -12,6 +12,8 @@ import router_graph
 import llm_graph
 import hello_graph
 import streaming_graph
+import human_in_the_loop_graph
+from langgraph.types import Command
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +226,51 @@ class TestLlmGraph:
         result = self._run("general", "gpt", "Hi there, how are you?", q)
         assert result["question"] == q
 
+    def test_answer_starts_with_provider_tag_gpt(self):
+        """Answer must open with [provider] — not merely contain it."""
+        result = self._run("general", "gpt", "Some answer.", "Any question?")
+        assert result["answer"].startswith("[gpt]")
+
+    def test_answer_starts_with_provider_tag_claude(self):
+        result = self._run("code", "claude", "def f(): pass", "Write a function.")
+        assert result["answer"].startswith("[claude]")
+
+    def test_unknown_classification_falls_back_to_default_provider(self):
+        """An unrecognised label from classify routes to DEFAULT_PROVIDER."""
+        fake = {
+            "claude": make_model("claude fallback"),
+            "gpt":    make_model("gpt answer"),
+        }
+        fake["gpt"].invoke.side_effect = [msg("mathematics"), msg("gpt answer")]
+        with patch.dict(router_graph.PROVIDERS, fake, clear=True):
+            result = llm_graph.app.invoke({"question": "What is 2+2?", "provider": "", "answer": ""})
+        assert result["provider"] == router_graph.DEFAULT_PROVIDER
+        assert f"[{router_graph.DEFAULT_PROVIDER}]" in result["answer"]
+
+    def test_code_routing_calls_claude_not_gpt_for_answer(self):
+        """When routed to claude, gpt handles classification only (one call)."""
+        fake = {
+            "claude": make_model("claude answer"),
+            "gpt":    make_model("gpt fallback"),
+        }
+        fake["gpt"].invoke.side_effect = [msg("code"), msg("gpt fallback")]
+        with patch.dict(router_graph.PROVIDERS, fake, clear=True):
+            llm_graph.app.invoke({"question": "Write a sort.", "provider": "", "answer": ""})
+        assert fake["gpt"].invoke.call_count == 1   # classify only
+        fake["claude"].invoke.assert_called_once()  # answer
+
+    def test_general_routing_does_not_call_claude(self):
+        """When routed to gpt, claude is never invoked."""
+        fake = {
+            "claude": make_model("claude fallback"),
+            "gpt":    make_model("gpt answer"),
+        }
+        fake["gpt"].invoke.side_effect = [msg("general"), msg("gpt answer")]
+        with patch.dict(router_graph.PROVIDERS, fake, clear=True):
+            llm_graph.app.invoke({"question": "Tell me a joke.", "provider": "", "answer": ""})
+        fake["claude"].invoke.assert_not_called()
+        assert fake["gpt"].invoke.call_count == 2   # classify + answer
+
 
 # ---------------------------------------------------------------------------
 # hello_graph — counter loop chained into router classify + respond
@@ -373,3 +420,66 @@ class TestStreamingGraph:
     def test_streaming_app_is_distinct_object(self):
         assert streaming_graph.app is not router_graph.app
         assert streaming_graph.app is not llm_graph.app
+
+
+# ---------------------------------------------------------------------------
+# human_in_the_loop_graph — interrupt/resume approval flow
+# ---------------------------------------------------------------------------
+
+class TestHumanInTheLoopGraph:
+    """Verifies the graph pauses at request_approval and resumes per decision.
+
+    No providers/LLMs are involved, so no stubbing is needed. Each run uses a
+    unique thread_id so the MemorySaver checkpointer keeps threads isolated.
+    """
+
+    def _pause(self, thread_id: str, request: str) -> dict:
+        """Invoke once; return the __interrupt__ payload for the paused graph."""
+        config = {"configurable": {"thread_id": thread_id}}
+        result = human_in_the_loop_graph.app.invoke(
+            {"request": request, "approved": False, "result": ""}, config
+        )
+        return result
+
+    def _resume(self, thread_id: str, approve: bool) -> dict:
+        config = {"configurable": {"thread_id": thread_id}}
+        return human_in_the_loop_graph.app.invoke(Command(resume=approve), config)
+
+    def test_pauses_before_completing(self):
+        result = self._pause("t-pause", "delete staging database")
+        interrupts = result.get("__interrupt__")
+        assert interrupts, "graph should pause and surface an __interrupt__ payload"
+        assert "delete staging database" in interrupts[0].value["question"]
+
+    @pytest.mark.parametrize("request_text", [
+        "delete staging database",
+        "deploy hotfix",
+        "rotate API keys",
+    ])
+    def test_approved_requests_are_applied(self, request_text):
+        thread_id = f"approve-{request_text}"
+        self._pause(thread_id, request_text)
+        result = self._resume(thread_id, approve=True)
+        assert result["approved"] is True
+        assert result["result"] == f"Draft action: {request_text} [APPLIED]"
+
+    @pytest.mark.parametrize("request_text", [
+        "delete staging database",
+        "deploy hotfix",
+        "rotate API keys",
+    ])
+    def test_rejected_requests_are_not_applied(self, request_text):
+        thread_id = f"reject-{request_text}"
+        self._pause(thread_id, request_text)
+        result = self._resume(thread_id, approve=False)
+        assert result["approved"] is False
+        assert result["result"] == f"Draft action: {request_text} [REJECTED]"
+
+    def test_threads_are_isolated(self):
+        """Different thread_ids resolve their own decisions independently."""
+        self._pause("iso-approve", "deploy hotfix")
+        self._pause("iso-reject", "deploy hotfix")
+        approved = self._resume("iso-approve", approve=True)
+        rejected = self._resume("iso-reject", approve=False)
+        assert approved["result"].endswith("[APPLIED]")
+        assert rejected["result"].endswith("[REJECTED]")

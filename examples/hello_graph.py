@@ -5,7 +5,9 @@ from router_graph import classify, respond
 
 load_dotenv()
 
-# Number of increments before handing off to the LLM router.
+# Amount added to the running total on each loop, and the total to reach
+# before handing off to the LLM router.
+STEP = 1
 MAX_COUNT = 3
 
 
@@ -16,20 +18,25 @@ class State(TypedDict):
     answer: str
 
 
-def increment(state: State) -> State:
-    return {"count": state["count"] + 1}
+def add(a: int, b: int) -> int:
+    """Add two numbers and return the result."""
+    return a + b
+
+
+def add_step(state: State) -> State:
+    return {"count": add(state["count"], STEP)}
 
 
 def should_continue(state: State) -> str:
-    return "classify" if state["count"] >= MAX_COUNT else "increment"
+    return "classify" if state["count"] >= MAX_COUNT else "add_step"
 
 
 graph = StateGraph(State)
-graph.add_node("increment", increment)
+graph.add_node("add_step", add_step)
 graph.add_node("classify", classify)
 graph.add_node("respond", respond)
-graph.set_entry_point("increment")
-graph.add_conditional_edges("increment", should_continue)
+graph.set_entry_point("add_step")
+graph.add_conditional_edges("add_step", should_continue)
 graph.add_edge("classify", "respond")
 graph.add_edge("respond", END)
 
