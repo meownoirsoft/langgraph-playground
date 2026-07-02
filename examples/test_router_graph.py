@@ -13,6 +13,7 @@ import llm_graph
 import hello_graph
 import streaming_graph
 import human_in_the_loop_graph
+import llm_graph_openai
 from langgraph.types import Command
 
 
@@ -483,3 +484,105 @@ class TestHumanInTheLoopGraph:
         rejected = self._resume("iso-reject", approve=False)
         assert approved["result"].endswith("[APPLIED]")
         assert rejected["result"].endswith("[REJECTED]")
+
+
+# ---------------------------------------------------------------------------
+# llm_graph_openai — self-contained multi-provider routing (openai + anthropic)
+# ---------------------------------------------------------------------------
+
+class TestLlmGraphOpenAI:
+    """Verifies multi-provider routing in llm_graph_openai.
+
+    llm_graph_openai owns its own PROVIDERS registry (keyed 'openai'/'anthropic')
+    and is patched independently from router_graph.PROVIDERS.
+    """
+
+    def _run(self, classify_label: str, provider: str, answer_text: str, question: str) -> dict:
+        fake = {
+            "openai":    make_model("openai fallback"),
+            "anthropic": make_model("anthropic fallback"),
+        }
+        fake[llm_graph_openai.DEFAULT_PROVIDER].invoke.side_effect = [
+            msg(classify_label), msg(answer_text)
+        ]
+        if provider != llm_graph_openai.DEFAULT_PROVIDER:
+            fake[provider] = make_model(answer_text)
+
+        with patch.dict(llm_graph_openai.PROVIDERS, fake, clear=True):
+            return llm_graph_openai.app.invoke(
+                {"question": question, "provider": "", "answer": ""}
+            )
+
+    def test_code_question_routed_to_anthropic(self):
+        result = self._run("code", "anthropic", "def add(a, b): return a + b",
+                           "Write a function to add two numbers.")
+        assert "[anthropic]" in result["answer"]
+        assert result["provider"] == "anthropic"
+
+    def test_general_question_routed_to_openai(self):
+        result = self._run("general", "openai", "Hello there!", "Say hello in exactly 5 words.")
+        assert "[openai]" in result["answer"]
+        assert result["provider"] == "openai"
+
+    def test_answer_starts_with_provider_tag_openai(self):
+        result = self._run("general", "openai", "Some answer.", "Any question?")
+        assert result["answer"].startswith("[openai]")
+
+    def test_answer_starts_with_provider_tag_anthropic(self):
+        result = self._run("code", "anthropic", "def f(): pass", "Write a function.")
+        assert result["answer"].startswith("[anthropic]")
+
+    def test_unknown_label_falls_back_to_default_provider(self):
+        """An unrecognised classification label routes to DEFAULT_PROVIDER."""
+        fake = {
+            "openai":    make_model("openai answer"),
+            "anthropic": make_model("anthropic fallback"),
+        }
+        fake["openai"].invoke.side_effect = [msg("mathematics"), msg("openai answer")]
+        with patch.dict(llm_graph_openai.PROVIDERS, fake, clear=True):
+            result = llm_graph_openai.app.invoke(
+                {"question": "What is 2+2?", "provider": "", "answer": ""}
+            )
+        assert result["provider"] == llm_graph_openai.DEFAULT_PROVIDER
+        assert f"[{llm_graph_openai.DEFAULT_PROVIDER}]" in result["answer"]
+
+    def test_code_routing_calls_anthropic_not_openai_for_answer(self):
+        """When routed to anthropic, openai handles classification only (one call)."""
+        fake = {
+            "openai":    make_model("openai fallback"),
+            "anthropic": make_model("anthropic answer"),
+        }
+        fake["openai"].invoke.side_effect = [msg("code"), msg("openai fallback")]
+        with patch.dict(llm_graph_openai.PROVIDERS, fake, clear=True):
+            llm_graph_openai.app.invoke(
+                {"question": "Write a sort.", "provider": "", "answer": ""}
+            )
+        assert fake["openai"].invoke.call_count == 1    # classify only
+        fake["anthropic"].invoke.assert_called_once()   # answer
+
+    def test_general_routing_does_not_call_anthropic(self):
+        """When routed to openai, anthropic is never invoked."""
+        fake = {
+            "openai":    make_model("openai answer"),
+            "anthropic": make_model("anthropic fallback"),
+        }
+        fake["openai"].invoke.side_effect = [msg("general"), msg("openai answer")]
+        with patch.dict(llm_graph_openai.PROVIDERS, fake, clear=True):
+            llm_graph_openai.app.invoke(
+                {"question": "Tell me a joke.", "provider": "", "answer": ""}
+            )
+        fake["anthropic"].invoke.assert_not_called()
+        assert fake["openai"].invoke.call_count == 2    # classify + answer
+
+    def test_state_keys_present(self):
+        result = self._run("general", "openai", "any answer", "Any question?")
+        assert {"question", "provider", "answer"} <= result.keys()
+
+    def test_original_question_preserved(self):
+        q = "Write a Python function to add two numbers."
+        result = self._run("code", "anthropic", "def add(a, b): return a + b", q)
+        assert result["question"] == q
+
+    def test_app_is_distinct_from_other_graphs(self):
+        assert llm_graph_openai.app is not router_graph.app
+        assert llm_graph_openai.app is not llm_graph.app
