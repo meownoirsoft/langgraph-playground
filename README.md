@@ -24,13 +24,13 @@ Secrets are managed with [phase.dev](https://phase.dev). Export `ANTHROPIC_API_K
 ## Running
 
 ```bash
-./venv/bin/python router_graph.py
+./venv/bin/python examples/router_graph.py
 ```
 
 ## Testing
 
 ```bash
-./venv/bin/pytest test_router_graph.py -v
+./venv/bin/pytest examples/test_router_graph.py -v
 ```
 
 All tests stub out the `PROVIDERS` registry so no real API calls are made.
@@ -47,7 +47,7 @@ langchain-google-genai
 
 ### 2. Register the model in `PROVIDERS`
 
-Open `router_graph.py` and add an entry to the `PROVIDERS` dict:
+Open `examples/router_graph.py` and add an entry to the `PROVIDERS` dict:
 
 ```python
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -86,8 +86,8 @@ No graph wiring changes are required — `respond()` looks up the provider from 
 ## Examples
 
 Beyond the router graph above, this repo has standalone scripts covering
-core LangGraph concepts. Each is runnable on its own with
-`./venv/bin/python <file>.py`.
+core LangGraph concepts, all under `examples/`. Each is runnable on its own with
+`./venv/bin/python examples/<file>.py`.
 
 | Script | Concept | What it shows |
 |---|---|---|
@@ -103,15 +103,18 @@ core LangGraph concepts. Each is runnable on its own with
 ## Project structure
 
 ```
-router_graph.py              # graph definition: classify + respond nodes
-hello_graph.py                # loop + conditional-edge example
-streaming_graph.py            # app.stream() updates/values example
-persistence_graph.py          # checkpointing / thread_id example
-human_in_the_loop_graph.py    # interrupt() / Command(resume=...) example
-tool_agent_graph.py           # ToolNode / tools_condition ReAct agent
-subgraph_graph.py             # compiled graph as a node example
-fan_out_fan_in_graph.py       # concurrent branches + reducer example
-time_travel_graph.py          # checkpoint history / forking example
-test_router_graph.py          # pytest suite (no live API calls)
-requirements.txt              # Python dependencies
+examples/
+  router_graph.py              # graph definition: classify + respond nodes
+  hello_graph.py                # loop + conditional-edge example
+  streaming_graph.py            # app.stream() updates/values example
+  persistence_graph.py          # checkpointing / thread_id example
+  human_in_the_loop_graph.py    # interrupt() / Command(resume=...) example
+  tool_agent_graph.py           # ToolNode / tools_condition ReAct agent
+  subgraph_graph.py             # compiled graph as a node example
+  fan_out_fan_in_graph.py       # concurrent branches + reducer example
+  time_travel_graph.py          # checkpoint history / forking example
+  llm_graph.py                  # single-node LLM call example
+  llm_graph_openai.py           # OpenAI-only variant of llm_graph
+  test_router_graph.py          # pytest suite (no live API calls)
+requirements.txt               # Python dependencies
 ```
